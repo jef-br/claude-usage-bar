@@ -19,11 +19,25 @@ export interface LimitHit {
     scope: 'session' | 'week';
 }
 
+/**
+ * Where a cap came from, in ascending order of trust:
+ *  - estimate:   high-water mark. A lower bound — reads high, never low.
+ *  - calibrated: back-computed from a percentage /usage reported. Exact for the meter in use.
+ *  - observed:   pinned by an actual limit hit. Ground truth.
+ */
+export type CapSource = 'estimate' | 'calibrated' | 'observed';
+
+export interface CapFact {
+    value: number;
+    source: 'calibrated' | 'observed';
+    at: number;
+}
+
 export interface WindowState {
     used: number;
     cap: number;
-    fill: number;           // used / cap, clamped to [0,1]
-    capIsObserved: boolean; // true = pinned by a real limit hit; false = high-water estimate
+    fill: number; // used / cap, clamped to [0,1]
+    capSource: CapSource;
     peakAt: number | null;
 }
 
@@ -55,7 +69,7 @@ export class UsageTracker {
     // Ratchet: the largest window we have ever seen sustained. Persisted by the caller so it
     // survives a transcript being deleted, and so it only ever grows.
     private highWater = { session: 0, week: 0 };
-    private observedCap: { session?: number; week?: number } = {};
+    private caps: { session?: CapFact; week?: CapFact } = {};
 
     constructor(private claudeHome: string) {}
 
@@ -63,18 +77,39 @@ export class UsageTracker {
         return path.join(os.homedir(), '.claude');
     }
 
-    seed(highWater: { session: number; week: number }, observedCap: { session?: number; week?: number }) {
+    seed(highWater: { session: number; week: number }, caps: { session?: CapFact; week?: CapFact }) {
         this.highWater = { ...highWater };
-        this.observedCap = { ...observedCap };
+        this.caps = { ...caps };
     }
 
     getHighWater() { return { ...this.highWater }; }
-    getObservedCap() { return { ...this.observedCap }; }
+    getCaps() { return { ...this.caps }; }
     getLimitHits() { return [...this.limitHits]; }
 
     resetHighWater() {
         this.highWater = { session: 0, week: 0 };
-        this.observedCap = {};
+        this.caps = {};
+    }
+
+    /**
+     * Pin a cap from a percentage that `/usage` reported. cap = used_now / fraction.
+     *
+     * Only valid for the meter in force when it was taken: the same reading implies a different cap
+     * depending on whether cache reads are counted. Recalibrate after changing includeCacheReads.
+     */
+    calibrate(scope: 'session' | 'week', fraction: number, windowMs: number, includeCacheReads: boolean): number {
+        if (!(fraction > 0 && fraction <= 1)) throw new Error('Percentage must be between 0 and 100.');
+        const meter = this.meterFor(includeCacheReads);
+        const now = Date.now();
+        const used = this.windowSum(now - windowMs, now, meter);
+        const value = Math.round(used / fraction);
+        this.caps[scope] = { value, source: 'calibrated', at: now };
+        return value;
+    }
+
+    private meterFor(includeCacheReads: boolean) {
+        return (e: UsageEvent) =>
+            e.input + e.output + e.cacheWrite + (includeCacheReads ? e.cacheRead : 0);
     }
 
     /** Re-read whatever has been appended since the last call. Cheap enough to run every few seconds. */
@@ -85,8 +120,7 @@ export class UsageTracker {
         }
         if (added) this.events.sort((a, b) => a.t - b.t);
 
-        const meter = (e: UsageEvent) =>
-            e.input + e.output + e.cacheWrite + (includeCacheReads ? e.cacheRead : 0);
+        const meter = this.meterFor(includeCacheReads);
 
         // Recompute peaks from the full history every refresh: 20k events is microseconds, and it
         // keeps the ratchet honest if the window length setting changes.
@@ -102,23 +136,24 @@ export class UsageTracker {
         const wUsed = this.windowSum(now - weekWindowMs, now, meter);
 
         return {
-            session: this.state(sUsed, this.observedCap.session, this.highWater.session, sPeak.at),
-            week: this.state(wUsed, this.observedCap.week, this.highWater.week, wPeak.at),
+            session: this.state(sUsed, this.caps.session, this.highWater.session, sPeak.at),
+            week: this.state(wUsed, this.caps.week, this.highWater.week, wPeak.at),
             events: this.events.length,
             since: this.events.length ? this.events[0].t : null
         };
     }
 
-    private state(used: number, observed: number | undefined, highWater: number, peakAt: number | null): WindowState {
-        // An observed limit hit is ground truth; the high-water mark is only a lower bound on the
-        // cap (we sustained it without being cut off, so the real cap is at least this). Reading
-        // against a lower bound makes the bar pessimistic, which is the safe direction to err.
-        const cap = observed ?? Math.max(highWater, 1);
+    private state(used: number, known: CapFact | undefined, highWater: number, peakAt: number | null): WindowState {
+        // A known cap (limit hit, or calibrated against /usage) is trusted outright. Otherwise fall
+        // back to the high-water mark, which is only a LOWER BOUND on the cap — we sustained it
+        // without being cut off, so the real cap is at least this. Reading against a lower bound
+        // makes the bar pessimistic, which is the safe direction to err.
+        const cap = known?.value ?? Math.max(highWater, 1);
         return {
             used,
             cap,
             fill: Math.min(1, used / cap),
-            capIsObserved: observed !== undefined,
+            capSource: known?.source ?? 'estimate',
             peakAt
         };
     }
@@ -157,12 +192,14 @@ export class UsageTracker {
      */
     private pinObservedCaps(sessionWindowMs: number, weekWindowMs: number, meter: (e: UsageEvent) => number) {
         for (const hit of this.limitHits) {
-            if (hit.scope === 'session' && this.observedCap.session === undefined) {
-                this.observedCap.session = this.windowSum(hit.t - sessionWindowMs, hit.t, meter);
-            }
-            if (hit.scope === 'week' && this.observedCap.week === undefined) {
-                this.observedCap.week = this.windowSum(hit.t - weekWindowMs, hit.t, meter);
-            }
+            const windowMs = hit.scope === 'session' ? sessionWindowMs : weekWindowMs;
+            // An actual limit hit outranks a calibration: it is the cap, not an inference from one.
+            if (this.caps[hit.scope]?.source === 'observed') continue;
+            this.caps[hit.scope] = {
+                value: this.windowSum(hit.t - windowMs, hit.t, meter),
+                source: 'observed',
+                at: hit.t
+            };
         }
     }
 

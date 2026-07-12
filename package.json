@@ -22,12 +22,16 @@
         "title": "Claude Usage: Refresh now"
       },
       {
+        "command": "claudeUsageBar.calibrate",
+        "title": "Claude Usage: Calibrate from /usage"
+      },
+      {
         "command": "claudeUsageBar.showDetails",
         "title": "Claude Usage: Show details"
       },
       {
         "command": "claudeUsageBar.resetHighWater",
-        "title": "Claude Usage: Reset high-water marks"
+        "title": "Claude Usage: Reset caps and high-water marks"
       }
     ],
     "configuration": {
