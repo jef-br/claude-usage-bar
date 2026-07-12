@@ -1,0 +1,79 @@
+{
+  "name": "claude-usage-bar",
+  "displayName": "Claude Usage Bar",
+  "description": "Session (5h) and weekly Claude Code token usage, as bars in the VS Code status bar.",
+  "version": "0.1.0",
+  "publisher": "jefbracke",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeUsageBar.refresh",
+        "title": "Claude Usage: Refresh now"
+      },
+      {
+        "command": "claudeUsageBar.showDetails",
+        "title": "Claude Usage: Show details"
+      },
+      {
+        "command": "claudeUsageBar.resetHighWater",
+        "title": "Claude Usage: Reset high-water marks"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Usage Bar",
+      "properties": {
+        "claudeUsageBar.includeCacheReads": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Count `cache_read_input_tokens` toward usage. Off by default: cache reads are ~97% of raw token volume and are heavily discounted wherever they are metered, so including them makes the bar track conversation length more than actual work."
+        },
+        "claudeUsageBar.sessionWindowHours": {
+          "type": "number",
+          "default": 5,
+          "description": "Length of the rolling session window, in hours."
+        },
+        "claudeUsageBar.weekWindowDays": {
+          "type": "number",
+          "default": 7,
+          "description": "Length of the rolling weekly window, in days."
+        },
+        "claudeUsageBar.refreshSeconds": {
+          "type": "number",
+          "default": 15,
+          "description": "How often to re-read transcripts and repaint. Reads are incremental (only bytes appended since the last poll)."
+        },
+        "claudeUsageBar.claudeHome": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the .claude directory. Empty means ~/.claude."
+        },
+        "claudeUsageBar.barCells": {
+          "type": "number",
+          "default": 5,
+          "description": "Width of each bar, in characters. Each cell renders 8 sub-steps of fill."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
