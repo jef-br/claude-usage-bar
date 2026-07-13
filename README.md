@@ -9,6 +9,12 @@ S █▋░░░   W ████▏
 Reads Claude Code's own transcripts (`~/.claude/projects/**/*.jsonl`), which record exact token
 counts per assistant message. No API calls, no scraping, no credentials.
 
+
+![image](preview.png)
+
+
+
+
 ## The cap is an estimate, and it is honest about that
 
 Anthropic does not publish your session/weekly token caps, and they are not stored anywhere on disk.
