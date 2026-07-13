@@ -4,7 +4,6 @@
   "description": "Session (5h) and weekly Claude Code token usage, as bars in the VS Code status bar.",
   "version": "0.1.0",
   "publisher": "jefbracke",
-  "private": true,
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -79,5 +78,10 @@
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.3.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jef-br/claude-usage-bar.git"
   }
 }
