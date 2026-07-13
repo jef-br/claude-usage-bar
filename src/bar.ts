@@ -1,11 +1,34 @@
 // Pure rendering — no vscode import, so it can be exercised outside the editor.
-// Palette and thresholds lifted verbatim from the original bar.html sketch.
+// Defaults are the palette and thresholds from the original bar.html sketch; both are overridable
+// from settings (claudeUsageBar.colors / claudeUsageBar.thresholds) with no rebuild.
 
-export const BAR_GREEN = '#009C00';
-export const BAR_YELLOW = '#f3f300';
-export const BAR_ORANGE = '#f99630';
-export const BAR_RED = '#e90000';
-export const BAR_MAXED = '#0033cc'; // --bgColorDark: at or over the estimated cap
+export interface Palette {
+    green: string;
+    yellow: string;
+    orange: string;
+    red: string;
+    maxed: string; // at or over cap
+}
+
+export interface Thresholds {
+    yellow: number; // fill at or above this is yellow
+    orange: number;
+    red: number;
+}
+
+export const DEFAULT_PALETTE: Palette = {
+    green: '#009C00',
+    yellow: '#f3f300',
+    orange: '#f99630',
+    red: '#e90000',
+    maxed: '#0033cc'
+};
+
+export const DEFAULT_THRESHOLDS: Thresholds = {
+    yellow: 0.5,
+    orange: 0.66,
+    red: 0.75
+};
 
 // Eighth-blocks give 8 sub-steps per cell, so the default 5-cell bar has 40 steps of fill.
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
@@ -23,10 +46,14 @@ export function renderBar(fill: number, cells: number): string {
     return out;
 }
 
-export function colorFor(fill: number): string {
-    if (fill < 0.5) return BAR_GREEN;
-    if (fill < 0.66) return BAR_YELLOW;
-    if (fill < 0.75) return BAR_ORANGE;
-    if (fill < 1) return BAR_RED;
-    return BAR_MAXED;
+export function colorFor(
+    fill: number,
+    palette: Palette = DEFAULT_PALETTE,
+    thresholds: Thresholds = DEFAULT_THRESHOLDS
+): string {
+    if (fill >= 1) return palette.maxed;
+    if (fill >= thresholds.red) return palette.red;
+    if (fill >= thresholds.orange) return palette.orange;
+    if (fill >= thresholds.yellow) return palette.yellow;
+    return palette.green;
 }

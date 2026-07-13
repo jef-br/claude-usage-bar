@@ -65,6 +65,67 @@
           "type": "number",
           "default": 5,
           "description": "Width of each bar, in characters. Each cell renders 8 sub-steps of fill."
+        },
+        "claudeUsageBar.colors": {
+          "type": "object",
+          "default": {
+            "green": "#009C00",
+            "yellow": "#f3f300",
+            "orange": "#f99630",
+            "red": "#e90000",
+            "maxed": "#0033cc"
+          },
+          "markdownDescription": "Bar colours as hex strings. Applied to the status bar item's foreground. Any key you omit keeps its default.",
+          "properties": {
+            "green": {
+              "type": "string",
+              "description": "Below the yellow threshold."
+            },
+            "yellow": {
+              "type": "string",
+              "description": "At or above the yellow threshold."
+            },
+            "orange": {
+              "type": "string",
+              "description": "At or above the orange threshold."
+            },
+            "red": {
+              "type": "string",
+              "description": "At or above the red threshold."
+            },
+            "maxed": {
+              "type": "string",
+              "description": "At or over the cap (100%)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "claudeUsageBar.thresholds": {
+          "type": "object",
+          "default": {
+            "yellow": 0.5,
+            "orange": 0.66,
+            "red": 0.75
+          },
+          "markdownDescription": "Fill fractions (0-1) at which each colour takes over. Any key you omit keeps its default.",
+          "properties": {
+            "yellow": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "orange": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "red": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "additionalProperties": false
         }
       }
     }

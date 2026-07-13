@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { colorFor, renderBar } from './bar';
+import { colorFor, DEFAULT_PALETTE, DEFAULT_THRESHOLDS, Palette, renderBar, Thresholds } from './bar';
 import { Snapshot, UsageTracker, WindowState } from './usage';
 
 const HIGH_WATER_KEY = 'claudeUsageBar.highWater';
@@ -93,14 +93,18 @@ function tick(context: vscode.ExtensionContext) {
     }
 
     const cells = Math.max(1, cfg.get<number>('barCells', 5));
-    paint(sessionItem, 'S', snap.session, cells);
-    paint(weekItem, 'W', snap.week, cells);
+    // A partial override in settings.json should keep the defaults for whatever it leaves out.
+    const palette: Palette = { ...DEFAULT_PALETTE, ...cfg.get<Partial<Palette>>('colors', {}) };
+    const thresholds: Thresholds = { ...DEFAULT_THRESHOLDS, ...cfg.get<Partial<Thresholds>>('thresholds', {}) };
+
+    paint(sessionItem, 'S', snap.session, cells, palette, thresholds);
+    paint(weekItem, 'W', snap.week, cells, palette, thresholds);
     weekItem.show();
 }
 
-function paint(item: vscode.StatusBarItem, label: string, w: WindowState, cells: number) {
+function paint(item: vscode.StatusBarItem, label: string, w: WindowState, cells: number, palette: Palette, thresholds: Thresholds) {
     item.text = `${label} ${renderBar(w.fill, cells)}`;
-    item.color = colorFor(w.fill);
+    item.color = colorFor(w.fill, palette, thresholds);
     item.tooltip = tooltip(label, w);
 }
 
