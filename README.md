@@ -1,63 +1,68 @@
 # Claude Usage Bar
 
-Two bars in the VS Code status bar: **S** = rolling 5-hour session usage, **W** = rolling 7-day usage.
+Two bars in the VS Code status bar: **S** = 5-hour session usage, **W** = weekly usage.
 
 ```
-S █▋░░░   W ████▏
+S █▍░░░ 28%   W ▏░░░░ 3%
 ```
-
-Reads Claude Code's own transcripts (`~/.claude/projects/**/*.jsonl`), which record exact token
-counts per assistant message. No API calls, no scraping, no credentials.
-
 
 ![image](preview.png)
 
+## Where the numbers come from
 
+Straight from `https://api.anthropic.com/api/oauth/usage` — **the same endpoint `/usage` itself
+calls**, authenticated with the OAuth token Claude Code has already stored on your machine. The
+percentages are the ones Anthropic computes, not a guess: same meter, same reset boundaries, same
+numbers you'd see by typing `/usage`.
 
+That also means the bar knows **when your limits reset** (hover either bar for a countdown), which is
+something no amount of local arithmetic can work out.
 
-## The cap is an estimate, and it is honest about that
+### Why not read the transcripts?
 
-Anthropic does not publish your session/weekly token caps, and they are not stored anywhere on disk.
-So the bar cannot show "% of your limit" directly. Instead:
+Earlier versions did, and it could not be made accurate. Transcripts record raw token counts, but:
 
-**The cap is a high-water mark.** It starts as the largest window you have ever *actually sustained*
-across your whole transcript history, and it ratchets upward whenever you exceed it. Because you
-sustained that window **without being cut off**, your true cap is at least that large — which means
-the bar reads **high rather than low**. It warns early, never late. That is the safe direction for a
-tool whose job is to stop you being surprised.
+- **Limits don't reset on a rolling window.** They reset at fixed boundaries the transcripts never
+  mention, so a local estimate keeps showing yesterday's usage after a reset has already cleared it.
+- **Limits aren't metered in raw tokens.** Anthropic weights usage per model, and doesn't publish the
+  weights or your cap.
 
-**It self-corrects the moment the truth becomes observable.** Claude Code records a hit limit as a
-synthetic assistant message. The first time you genuinely hit a *session* or *weekly* limit, the
-extension snaps that window's total in as the exact cap and stops estimating. Model-scoped limits
-("You've reached your Fable 5 limit") are deliberately ignored — that is a separate budget, and
-pinning it would give you a wrong number.
+Anything derived from `~/.claude/projects/**/*.jsonl` is therefore an estimate with no way to
+self-correct. This extension no longer guesses.
 
-Hover either bar to see whether its cap is an estimate or an observed fact.
+## Credentials
 
-## Metering
+Read-only, from `~/.claude/.credentials.json` (or the macOS Keychain). The token is re-read on every
+poll, so when Claude Code rotates it in the background the bar picks it up with no restart.
 
-By default: `input + output + cache_creation`. Cache **reads** are excluded, because they are ~97% of
-raw token volume and are heavily discounted wherever they are metered — counting them would make the
-bar track conversation length more than actual work. Flip `claudeUsageBar.includeCacheReads` if you
-disagree; in practice all plausible meters agree on the percentage within about ten points.
+The extension **never refreshes the token itself.** Refreshing rotates the refresh token, and racing
+Claude Code for it would sign you out of both. If sign-in expires, run `claude` once in a terminal
+and the bar recovers on its next poll.
+
+## Failure behaviour
+
+A wrong number is worse than no number. If the API can't be reached, the bar keeps the last good
+reading but flags it with a ⚠ and tells you in the tooltip how stale it is. If a reading was never
+obtained, it says so rather than showing an empty bar.
 
 ## Colours
 
-From the original sketch: green below 50%, yellow to 66%, orange to 75%, red to 100%, dark blue at
-cap. `S` and `W` are separate status bar items, so they colour independently.
+Green below 50%, yellow to 66%, orange to 75%, red to 100%, dark blue at cap. `S` and `W` are
+separate status bar items, so they colour independently. Both the palette and the thresholds are
+settings.
 
 ## Settings
 
 | Setting | Default | |
 |---|---|---|
-| `claudeUsageBar.includeCacheReads` | `false` | count cache reads toward usage |
-| `claudeUsageBar.sessionWindowHours` | `5` | session window length |
-| `claudeUsageBar.weekWindowDays` | `7` | weekly window length |
-| `claudeUsageBar.refreshSeconds` | `15` | poll interval |
+| `claudeUsageBar.refreshSeconds` | `60` | poll interval (min 15); also refreshes on window focus |
+| `claudeUsageBar.showPercent` | `true` | show the numeric percentage next to each bar |
 | `claudeUsageBar.barCells` | `5` | bar width in characters (8 sub-steps each) |
-| `claudeUsageBar.claudeHome` | `~/.claude` | override the Claude Code data directory |
+| `claudeUsageBar.claudeHome` | `~/.claude` | where to read the sign-in token from |
+| `claudeUsageBar.colors` | — | palette overrides |
+| `claudeUsageBar.thresholds` | — | fill fractions at which each colour takes over |
 
-Commands: **Claude Usage: Refresh now**, **Show details**, **Reset high-water marks**.
+Commands: **Claude Usage: Refresh now**, **Claude Usage: Show details**.
 
 ## Develop
 
@@ -71,10 +76,5 @@ npm run compile
 
 ```bash
 npx @vscode/vsce package
-code --install-extension claude-usage-bar-0.1.0.vsix
+code --install-extension claude-usage-bar-0.2.0.vsix
 ```
-
-## Performance
-
-Cold scan of ~19,500 messages across ~200 transcripts: **~700ms**, once, at startup. After that each
-poll reads only the bytes appended since the last one: **~8ms**.

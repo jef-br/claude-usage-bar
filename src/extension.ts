@@ -1,23 +1,20 @@
+import * as os from 'os';
+import * as path from 'path';
 import * as vscode from 'vscode';
+import { fetchUsage, Meter, UsageSnapshot } from './api';
 import { colorFor, DEFAULT_PALETTE, DEFAULT_THRESHOLDS, Palette, renderBar, Thresholds } from './bar';
-import { Snapshot, UsageTracker, WindowState } from './usage';
 
-const HIGH_WATER_KEY = 'claudeUsageBar.highWater';
-const CAPS_KEY = 'claudeUsageBar.caps';
-
-let tracker: UsageTracker;
 let sessionItem: vscode.StatusBarItem;
 let weekItem: vscode.StatusBarItem;
+let channel: vscode.OutputChannel;
 let timer: NodeJS.Timeout | undefined;
 
-export function activate(context: vscode.ExtensionContext) {
-    const home = config().get<string>('claudeHome') || UsageTracker.defaultHome();
-    tracker = new UsageTracker(home);
-    tracker.seed(
-        context.globalState.get(HIGH_WATER_KEY, { session: 0, week: 0 }),
-        context.globalState.get(CAPS_KEY, {})
-    );
+/** Last successful read. Kept across failures so a blip shows a stale-but-real number, never a wrong one. */
+let snapshot: UsageSnapshot | undefined;
+let failure: string | undefined;
+let inFlight = false;
 
+export function activate(context: vscode.ExtensionContext) {
     // Left side, so it sits with the git indicators rather than off in the language/encoding cluster.
     sessionItem = vscode.window.createStatusBarItem('claudeUsageBar.session', vscode.StatusBarAlignment.Left, 100);
     weekItem = vscode.window.createStatusBarItem('claudeUsageBar.week', vscode.StatusBarAlignment.Left, 99);
@@ -25,27 +22,27 @@ export function activate(context: vscode.ExtensionContext) {
     weekItem.name = 'Claude weekly usage';
     sessionItem.command = 'claudeUsageBar.showDetails';
     weekItem.command = 'claudeUsageBar.showDetails';
-    context.subscriptions.push(sessionItem, weekItem);
+
+    channel = vscode.window.createOutputChannel('Claude Usage');
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('claudeUsageBar.refresh', () => tick(context)),
-        vscode.commands.registerCommand('claudeUsageBar.showDetails', () => showDetails(context)),
-        vscode.commands.registerCommand('claudeUsageBar.calibrate', () => calibrate(context)),
-        vscode.commands.registerCommand('claudeUsageBar.resetHighWater', async () => {
-            tracker.resetHighWater();
-            await context.globalState.update(HIGH_WATER_KEY, { session: 0, week: 0 });
-            await context.globalState.update(CAPS_KEY, {});
-            tick(context);
-            vscode.window.showInformationMessage('Claude Usage: caps reset; rebuilt from transcript history.');
-        }),
+        sessionItem,
+        weekItem,
+        channel,
+        vscode.commands.registerCommand('claudeUsageBar.refresh', refreshCommand),
+        vscode.commands.registerCommand('claudeUsageBar.showDetails', showDetails),
         vscode.workspace.onDidChangeConfiguration(e => {
-            if (e.affectsConfiguration('claudeUsageBar')) restartTimer(context);
+            if (e.affectsConfiguration('claudeUsageBar')) restartTimer();
+        }),
+        // Coming back to the window is the moment a stale bar is most likely to mislead.
+        vscode.window.onDidChangeWindowState(state => {
+            if (state.focused) void poll();
         })
     );
 
+    sessionItem.text = 'S $(sync~spin)';
     sessionItem.show();
-    weekItem.show();
-    restartTimer(context);
+    restartTimer();
 }
 
 export function deactivate() {
@@ -56,135 +53,163 @@ function config() {
     return vscode.workspace.getConfiguration('claudeUsageBar');
 }
 
-function restartTimer(context: vscode.ExtensionContext) {
-    if (timer) clearInterval(timer);
-    tick(context);
-    const seconds = Math.max(5, config().get<number>('refreshSeconds', 15));
-    timer = setInterval(() => tick(context), seconds * 1000);
+function claudeHome(): string {
+    return config().get<string>('claudeHome') || path.join(os.homedir(), '.claude');
 }
 
-let last: Snapshot | undefined;
+function restartTimer() {
+    if (timer) clearInterval(timer);
+    void poll();
+    // Floor of 15s: the endpoint is cheap but it is a shared service, not a local file.
+    const seconds = Math.max(15, config().get<number>('refreshSeconds', 60));
+    timer = setInterval(() => void poll(), seconds * 1000);
+}
 
-function tick(context: vscode.ExtensionContext) {
-    const cfg = config();
-    const sessionMs = cfg.get<number>('sessionWindowHours', 5) * 3600_000;
-    const weekMs = cfg.get<number>('weekWindowDays', 7) * 86_400_000;
-    const includeCacheReads = cfg.get<boolean>('includeCacheReads', false);
-
-    let snap: Snapshot;
+async function poll(): Promise<void> {
+    if (inFlight) return;
+    inFlight = true;
     try {
-        snap = tracker.refresh(sessionMs, weekMs, includeCacheReads);
+        // fetchUsage re-reads the credential file every time, so a token Claude Code rotated in the
+        // background is picked up here without a restart.
+        snapshot = await fetchUsage(claudeHome());
+        failure = undefined;
     } catch (err) {
-        sessionItem.text = 'S $(error)';
-        sessionItem.tooltip = `Claude Usage: could not read transcripts — ${err}`;
-        weekItem.hide();
-        return;
+        failure = err instanceof Error ? err.message : String(err);
+    } finally {
+        inFlight = false;
+        paintAll();
     }
-    last = snap;
+}
 
-    void context.globalState.update(HIGH_WATER_KEY, tracker.getHighWater());
-    void context.globalState.update(CAPS_KEY, tracker.getCaps());
-
-    if (snap.events === 0) {
-        sessionItem.text = 'S $(dash)';
-        sessionItem.tooltip = 'Claude Usage: no transcripts found under ~/.claude/projects.';
-        weekItem.hide();
-        return;
-    }
-
+function paintAll() {
+    const cfg = config();
     const cells = Math.max(1, cfg.get<number>('barCells', 5));
     // A partial override in settings.json should keep the defaults for whatever it leaves out.
     const palette: Palette = { ...DEFAULT_PALETTE, ...cfg.get<Partial<Palette>>('colors', {}) };
     const thresholds: Thresholds = { ...DEFAULT_THRESHOLDS, ...cfg.get<Partial<Thresholds>>('thresholds', {}) };
+    const showPercent = cfg.get<boolean>('showPercent', true);
 
-    paint(sessionItem, 'S', snap.session, cells, palette, thresholds);
-    paint(weekItem, 'W', snap.week, cells, palette, thresholds);
+    if (!snapshot) {
+        sessionItem.text = '$(warning) Claude usage';
+        sessionItem.color = undefined;
+        sessionItem.tooltip = failureTooltip();
+        sessionItem.show();
+        weekItem.hide();
+        return;
+    }
+
+    const stale = failure !== undefined;
+    paint(sessionItem, 'S', snapshot.session, cells, palette, thresholds, showPercent, stale);
+    paint(weekItem, 'W', snapshot.week, cells, palette, thresholds, showPercent, stale);
     weekItem.show();
 }
 
-function paint(item: vscode.StatusBarItem, label: string, w: WindowState, cells: number, palette: Palette, thresholds: Thresholds) {
-    item.text = `${label} ${renderBar(w.fill, cells)}`;
-    item.color = colorFor(w.fill, palette, thresholds);
-    item.tooltip = tooltip(label, w);
+function paint(
+    item: vscode.StatusBarItem,
+    label: string,
+    m: Meter,
+    cells: number,
+    palette: Palette,
+    thresholds: Thresholds,
+    showPercent: boolean,
+    stale: boolean
+) {
+    const fill = Math.min(1, Math.max(0, m.percent / 100));
+    const pct = showPercent ? ` ${Math.round(m.percent)}%` : '';
+    item.text = `${stale ? '$(warning) ' : ''}${label} ${renderBar(fill, cells)}${pct}`;
+    item.color = colorFor(fill, palette, thresholds);
+    item.tooltip = tooltip(label, m, stale);
 }
 
-function tooltip(label: string, w: WindowState): vscode.MarkdownString {
-    const title = label === 'S' ? 'Session (rolling 5h)' : 'Week (rolling 7d)';
+function tooltip(label: string, m: Meter, stale: boolean): vscode.MarkdownString {
     const md = new vscode.MarkdownString();
-    md.appendMarkdown(`**${title}**\n\n`);
-    md.appendMarkdown(`Used: \`${w.used.toLocaleString()}\` tokens — **${(w.fill * 100).toFixed(1)}%**\n\n`);
-    md.appendMarkdown(`Cap: \`${w.cap.toLocaleString()}\`\n\n`);
+    md.appendMarkdown(`**${label === 'S' ? 'Session' : 'Weekly'}** — ${m.percent.toFixed(0)}% used\n\n`);
+    md.appendMarkdown(`Resets ${untilText(m.resetsAt)}${m.resetsAt ? ` (${new Date(m.resetsAt).toLocaleString()})` : ''}\n\n`);
 
-    if (w.capSource === 'observed') {
-        md.appendMarkdown(`_Cap is **exact** — pinned from a real limit hit._`);
-    } else if (w.capSource === 'calibrated') {
-        md.appendMarkdown(`_Cap is **calibrated** against a percentage \`/usage\` reported. Re-run **Claude Usage: Calibrate from /usage** if it drifts._`);
+    if (label === 'W' && snapshot?.scoped.length) {
+        const active = snapshot.scoped.filter(s => s.percent > 0);
+        if (active.length) {
+            md.appendMarkdown(`Per-model weekly: ${active.map(s => `${s.label} ${s.percent.toFixed(0)}%`).join(', ')}\n\n`);
+        }
+    }
+
+    md.appendMarkdown('---\n\n');
+    if (stale) {
+        md.appendMarkdown(`$(warning) **Stale** — last good read ${new Date(snapshot!.fetchedAt).toLocaleTimeString()}.\n\n`);
+        md.appendMarkdown(`Latest attempt failed: ${failure}`);
+        md.supportThemeIcons = true;
     } else {
-        const when = w.peakAt ? new Date(w.peakAt).toLocaleDateString() : 'unknown';
-        md.appendMarkdown(
-            `_Cap is an **estimate**: the largest ${label === 'S' ? '5h' : '7d'} window you have ever ` +
-            `sustained without being cut off (peak ${when}). The real cap is at least this, so the bar ` +
-            `reads high rather than low. Run **Claude Usage: Calibrate from /usage** to make it exact._`
-        );
+        md.appendMarkdown(`_Live from Claude's usage API — the same numbers \`/usage\` reports. Updated ${new Date(snapshot!.fetchedAt).toLocaleTimeString()}._`);
     }
     return md;
 }
 
-/**
- * Ask for what `/usage` currently reports and back-compute the caps: cap = used_now / fraction.
- * This is the only way to learn the true cap short of actually hitting it.
- */
-async function calibrate(context: vscode.ExtensionContext) {
-    const cfg = config();
-    const includeCacheReads = cfg.get<boolean>('includeCacheReads', false);
-    const windows: Array<{ scope: 'session' | 'week'; label: string; ms: number }> = [
-        { scope: 'session', label: 'Session (5h)', ms: cfg.get<number>('sessionWindowHours', 5) * 3600_000 },
-        { scope: 'week', label: 'Week (7d)', ms: cfg.get<number>('weekWindowDays', 7) * 86_400_000 }
-    ];
-
-    const applied: string[] = [];
-    for (const w of windows) {
-        const answer = await vscode.window.showInputBox({
-            title: `Calibrate — ${w.label}`,
-            prompt: `Run /usage in Claude Code. What percentage does it report for ${w.label}? Leave blank to skip.`,
-            placeHolder: 'e.g. 68',
-            validateInput: v => {
-                if (!v.trim()) return null;
-                const n = Number(v.replace('%', '').trim());
-                return Number.isFinite(n) && n > 0 && n <= 100 ? null : 'Enter a number between 0 and 100.';
-            }
-        });
-        if (answer === undefined) return; // escaped
-        if (!answer.trim()) continue;
-
-        const pct = Number(answer.replace('%', '').trim());
-        const cap = tracker.calibrate(w.scope, pct / 100, w.ms, includeCacheReads);
-        applied.push(`${w.label}: cap ≈ ${cap.toLocaleString()} tokens`);
-    }
-
-    if (applied.length === 0) return;
-    await context.globalState.update(CAPS_KEY, tracker.getCaps());
-    tick(context);
-    vscode.window.showInformationMessage(`Claude Usage calibrated — ${applied.join('; ')}`);
+function failureTooltip(): vscode.MarkdownString {
+    const md = new vscode.MarkdownString();
+    md.appendMarkdown(`**Claude Usage — no data**\n\n${failure ?? 'Loading…'}`);
+    return md;
 }
 
-async function showDetails(context: vscode.ExtensionContext) {
-    if (!last) {
-        vscode.window.showInformationMessage('Claude Usage: no data yet.');
+/** Relative reset time. "in 3h 12m" is what you actually want to know; the wall clock is secondary. */
+function untilText(t: number | null): string {
+    if (t === null) return 'at an unknown time';
+    const ms = t - Date.now();
+    if (ms <= 0) return 'now';
+    const mins = Math.round(ms / 60_000);
+    if (mins < 60) return `in ${mins}m`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `in ${hours}h ${mins % 60}m`;
+    return `in ${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+/**
+ * A command that silently does its work reads as a broken command. Always land some visible signal:
+ * a transient status message on success, a modal-free warning on failure.
+ */
+async function refreshCommand() {
+    await poll();
+    if (failure) {
+        const action = failure.includes('sign in') ? 'How do I fix this?' : undefined;
+        const picked = await vscode.window.showWarningMessage(`Claude Usage: ${failure}`, ...(action ? [action] : []));
+        if (picked) showDetails();
         return;
     }
-    const hits = tracker.getLimitHits();
-    const lines = [
-        `Session (5h):  ${last.session.used.toLocaleString()} / ${last.session.cap.toLocaleString()}  (${(last.session.fill * 100).toFixed(1)}%)  cap: ${last.session.capSource}`,
-        `Week    (7d):  ${last.week.used.toLocaleString()} / ${last.week.cap.toLocaleString()}  (${(last.week.fill * 100).toFixed(1)}%)  cap: ${last.week.capSource}`,
-        ``,
-        `Messages tracked: ${last.events.toLocaleString()}`,
-        `History since:    ${last.since ? new Date(last.since).toLocaleString() : 'n/a'}`,
-        `Metering:         input + output + cache_write${config().get<boolean>('includeCacheReads') ? ' + cache_read' : ' (cache reads excluded)'}`,
-        `Limit hits seen:  ${hits.length === 0 ? 'none — caps are high-water estimates' : hits.map(h => new Date(h.t).toLocaleString()).join(', ')}`
-    ];
-    const channel = vscode.window.createOutputChannel('Claude Usage');
+    vscode.window.setStatusBarMessage(
+        `$(check) Claude Usage: session ${snapshot!.session.percent.toFixed(0)}%, week ${snapshot!.week.percent.toFixed(0)}%`,
+        4000
+    );
+}
+
+function showDetails() {
+    const lines: string[] = [];
+    if (snapshot) {
+        lines.push(
+            `Session   ${snapshot.session.percent.toFixed(0).padStart(3)}%   resets ${untilText(snapshot.session.resetsAt)}   ${stamp(snapshot.session.resetsAt)}`,
+            `Weekly    ${snapshot.week.percent.toFixed(0).padStart(3)}%   resets ${untilText(snapshot.week.resetsAt)}   ${stamp(snapshot.week.resetsAt)}`
+        );
+        for (const s of snapshot.scoped) {
+            lines.push(`  ${s.label} (weekly)  ${s.percent.toFixed(0).padStart(3)}%`);
+        }
+        lines.push('', `Last successful read: ${new Date(snapshot.fetchedAt).toLocaleString()}`);
+    } else {
+        lines.push('No usage data yet.');
+    }
+
+    lines.push('', `Source: https://api.anthropic.com/api/oauth/usage (the endpoint /usage itself calls)`);
+    lines.push(`Credentials: ${path.join(claudeHome(), '.credentials.json')}${process.platform === 'darwin' ? ' or macOS Keychain' : ''}`);
+
+    if (failure) {
+        lines.push('', `Last attempt FAILED: ${failure}`);
+        lines.push('', 'If sign-in has expired, run `claude` in a terminal once — Claude Code will refresh');
+        lines.push('the token and this bar will pick it up on the next poll. This extension deliberately');
+        lines.push('never refreshes the token itself, to avoid signing you out of Claude Code.');
+    }
+
     channel.clear();
     channel.appendLine(lines.join('\n'));
     channel.show(true);
+}
+
+function stamp(t: number | null): string {
+    return t ? `(${new Date(t).toLocaleString()})` : '';
 }
