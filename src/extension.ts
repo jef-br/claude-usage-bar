@@ -1,13 +1,22 @@
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { fetchUsage, Meter, UsageSnapshot } from './api';
+import { fetchUsage, Meter, RateLimitError, UsageSnapshot } from './api';
 import { colorFor, DEFAULT_PALETTE, DEFAULT_THRESHOLDS, Palette, renderBar, Thresholds } from './bar';
+import * as shared from './shared';
+
+/** What the usage endpoint tolerates: one call per 2.5 minutes, across every window. */
+const MIN_REFRESH_SECONDS = 150;
+
+/** Escalating pause after a 429, so we stop feeding the thing that rate-limited us. */
+const MIN_BACKOFF_MS = 150_000;
+const MAX_BACKOFF_MS = 15 * 60_000;
 
 let sessionItem: vscode.StatusBarItem;
 let weekItem: vscode.StatusBarItem;
 let channel: vscode.OutputChannel;
 let timer: NodeJS.Timeout | undefined;
+let stateFile: string;
 
 /** Last successful read. Kept across failures so a blip shows a stale-but-real number, never a wrong one. */
 let snapshot: UsageSnapshot | undefined;
@@ -24,6 +33,9 @@ export function activate(context: vscode.ExtensionContext) {
     weekItem.command = 'claudeUsageBar.showDetails';
 
     channel = vscode.window.createOutputChannel('Claude Usage');
+    // Global storage is one directory per install, shared by every window — which is what lets the
+    // windows pool a single API call between them instead of each making their own.
+    stateFile = shared.stateFile(context.globalStorageUri.fsPath);
 
     context.subscriptions.push(
         sessionItem,
@@ -57,28 +69,84 @@ function claudeHome(): string {
     return config().get<string>('claudeHome') || path.join(os.homedir(), '.claude');
 }
 
+function refreshMs(): number {
+    // The endpoint allows one call per 2.5 minutes. That is the floor as well as the default: a
+    // lower setting only earns a 429, and the floor is enforced here rather than trusted to the
+    // `minimum` in package.json, which a hand-edited settings.json can simply ignore.
+    return Math.max(MIN_REFRESH_SECONDS, config().get<number>('refreshSeconds', MIN_REFRESH_SECONDS)) * 1000;
+}
+
 function restartTimer() {
     if (timer) clearInterval(timer);
     void poll();
-    // Floor of 15s: the endpoint is cheap but it is a shared service, not a local file.
-    const seconds = Math.max(15, config().get<number>('refreshSeconds', 60));
-    timer = setInterval(() => void poll(), seconds * 1000);
+    timer = setInterval(() => void poll(), refreshMs());
 }
 
-async function poll(): Promise<void> {
+/**
+ * One tick. The API call is the last resort, not the first move: we serve from what another window
+ * already fetched where we can, we honour any rate-limit backoff, and only one window at a time is
+ * allowed to go to the network. `force` (the manual Refresh command) skips the freshness shortcut —
+ * but never the backoff, because ignoring a 429 is what got us rate-limited in the first place.
+ */
+async function poll(force = false): Promise<void> {
     if (inFlight) return;
     inFlight = true;
     try {
-        // fetchUsage re-reads the credential file every time, so a token Claude Code rotated in the
-        // background is picked up here without a restart.
-        snapshot = await fetchUsage(claudeHome());
-        failure = undefined;
-    } catch (err) {
-        failure = err instanceof Error ? err.message : String(err);
+        const state = shared.read(stateFile);
+        adopt(state.snapshot);
+
+        const now = Date.now();
+        if (state.backoffUntil && now < state.backoffUntil) {
+            failure = `Rate limited (HTTP 429). Not calling the usage API again until ${new Date(state.backoffUntil).toLocaleTimeString()}.`;
+            return;
+        }
+        // Someone else's read is recent enough to be ours too. This is what collapses N windows into
+        // one caller: focus changes and staggered timers now cost nothing.
+        if (!force && snapshot && now - snapshot.fetchedAt < refreshMs() * 0.9) {
+            failure = undefined;
+            return;
+        }
+        // Another window is mid-fetch. Its result lands in the state file; we pick it up next tick.
+        if (!shared.acquireLock(stateFile)) return;
+
+        try {
+            // fetchUsage re-reads the credential file every time, so a token Claude Code rotated in
+            // the background is picked up here without a restart.
+            snapshot = await fetchUsage(claudeHome());
+            failure = undefined;
+            shared.write(stateFile, { snapshot, strikes: 0 });
+        } catch (err) {
+            failure = err instanceof Error ? err.message : String(err);
+            if (err instanceof RateLimitError) {
+                const strikes = (state.strikes ?? 0) + 1;
+                const backoffUntil = Date.now() + backoffFor(strikes, err.retryAfterMs);
+                failure = `Rate limited (HTTP 429). Not calling the usage API again until ${new Date(backoffUntil).toLocaleTimeString()}.`;
+                // Written to shared state, so every other window stands down too — one window that
+                // keeps hammering would hold all of them in the penalty box.
+                shared.write(stateFile, { snapshot, backoffUntil, strikes });
+            } else {
+                shared.write(stateFile, { snapshot, strikes: 0 });
+            }
+        } finally {
+            shared.releaseLock(stateFile);
+        }
     } finally {
         inFlight = false;
         paintAll();
     }
+}
+
+/** Take another window's read if it is newer than ours. */
+function adopt(candidate: UsageSnapshot | undefined) {
+    if (candidate && (!snapshot || candidate.fetchedAt > snapshot.fetchedAt)) {
+        snapshot = candidate;
+    }
+}
+
+/** Server's Retry-After wins if it asks for longer; otherwise double each strike, capped. */
+function backoffFor(strikes: number, retryAfterMs: number | null): number {
+    const escalating = Math.min(MAX_BACKOFF_MS, MIN_BACKOFF_MS * 2 ** (strikes - 1));
+    return Math.min(MAX_BACKOFF_MS, Math.max(escalating, retryAfterMs ?? 0));
 }
 
 function paintAll() {
@@ -167,7 +235,7 @@ function untilText(t: number | null): string {
  * a transient status message on success, a modal-free warning on failure.
  */
 async function refreshCommand() {
-    await poll();
+    await poll(true);
     if (failure) {
         const action = failure.includes('sign in') ? 'How do I fix this?' : undefined;
         const picked = await vscode.window.showWarningMessage(`Claude Usage: ${failure}`, ...(action ? [action] : []));
@@ -200,9 +268,16 @@ function showDetails() {
 
     if (failure) {
         lines.push('', `Last attempt FAILED: ${failure}`);
-        lines.push('', 'If sign-in has expired, run `claude` in a terminal once — Claude Code will refresh');
-        lines.push('the token and this bar will pick it up on the next poll. This extension deliberately');
-        lines.push('never refreshes the token itself, to avoid signing you out of Claude Code.');
+        if (failure.includes('429')) {
+            lines.push('', 'Every VS Code window shares one poll through this file, and all of them stand down');
+            lines.push(`while the backoff runs: ${stateFile}`);
+            lines.push('The bars keep showing the last good read meanwhile. If it keeps recurring, raise');
+            lines.push('claudeUsageBar.refreshSeconds.');
+        } else {
+            lines.push('', 'If sign-in has expired, run `claude` in a terminal once — Claude Code will refresh');
+            lines.push('the token and this bar will pick it up on the next poll. This extension deliberately');
+            lines.push('never refreshes the token itself, to avoid signing you out of Claude Code.');
+        }
     }
 
     channel.clear();

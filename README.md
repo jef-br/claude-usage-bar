@@ -55,7 +55,7 @@ settings.
 
 | Setting | Default | |
 |---|---|---|
-| `claudeUsageBar.refreshSeconds` | `60` | poll interval (min 15); also refreshes on window focus |
+| `claudeUsageBar.refreshSeconds` | `150` | poll interval — 2.5 min is what the endpoint tolerates, and is also the floor. All windows share one poll at this rate; window-focus refreshes are served from it |
 | `claudeUsageBar.showPercent` | `true` | show the numeric percentage next to each bar |
 | `claudeUsageBar.barCells` | `5` | bar width in characters (8 sub-steps each) |
 | `claudeUsageBar.claudeHome` | `~/.claude` | where to read the sign-in token from |

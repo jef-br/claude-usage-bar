@@ -20,6 +20,12 @@ const TIMEOUT_MS = 15_000;
 export class AuthError extends Error {}
 /** The endpoint was reachable but unhappy, or wasn't reachable at all. Retrying may fix it. */
 export class ApiError extends Error {}
+/** We are polling too hard. Retrying before `retryAfterMs` has elapsed only deepens the hole. */
+export class RateLimitError extends ApiError {
+    constructor(message: string, readonly retryAfterMs: number | null) {
+        super(message);
+    }
+}
 
 /** One limit meter, as a percentage of the cap with the instant it resets. */
 export interface Meter {
@@ -127,6 +133,10 @@ function getJson(url: string, token: string): Promise<any> {
                         reject(new AuthError('Claude Code sign-in has expired. Run `claude` to sign in again.'));
                         return;
                     }
+                    if (status === 429) {
+                        reject(new RateLimitError('Usage API returned HTTP 429 (too many requests).', retryAfterMs(res.headers['retry-after'])));
+                        return;
+                    }
                     if (status < 200 || status >= 300) {
                         reject(new ApiError(`Usage API returned HTTP ${status}.`));
                         return;
@@ -143,6 +153,16 @@ function getJson(url: string, token: string): Promise<any> {
         req.on('error', err => reject(err instanceof ApiError ? err : new ApiError(err.message)));
         req.end();
     });
+}
+
+/** Retry-After is either a delta in seconds or an HTTP date. Both are legal; handle both. */
+function retryAfterMs(header: string | string[] | undefined): number | null {
+    const raw = Array.isArray(header) ? header[0] : header;
+    if (!raw) return null;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    const at = Date.parse(raw);
+    return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
 }
 
 export function parseUsage(body: any): UsageSnapshot {
